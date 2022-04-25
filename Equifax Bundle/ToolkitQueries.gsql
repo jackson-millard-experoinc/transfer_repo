@@ -1,0 +1,793 @@
+USE GRAPH CommHierarchy
+
+CREATE OR REPLACE QUERY keyword_search_vertex(STRING search_term, SET<STRING> vertex_types) RETURNS (SET<VERTEX>){
+   
+   SetAccum<VERTEX> @@vertex_list;
+   SetAccum<STRING> @@vertex_types;
+   vList = {};
+      
+   FOREACH str IN vertex_types DO 
+     @@vertex_types += UPPER(str);
+   END;
+
+  SiteList = {};
+  IF "Site" IN @@vertex_types OR count(@@vertex_types) == 0 THEN 
+    SiteList = {Site.*};
+    SiteList = SELECT v
+                    FROM SiteList:v
+                    WHERE v.name LIKE search_term
+                    OR v.protectionInfo LIKE search_term
+                    OR v.siteKeyId_encrypted LIKE search_term
+                    ;
+  END;
+
+  vList = SiteList UNION vList;
+  AddressList = {};
+  IF "Address" IN @@vertex_types OR count(@@vertex_types) == 0 THEN 
+    AddressList = {Address.*};
+    AddressList = SELECT v
+                    FROM AddressList:v
+                    WHERE v.addressLine1 LIKE search_term
+                    OR v.city LIKE search_term
+                    OR v.state LIKE search_term
+                    OR v.postalCode LIKE search_term
+                    OR v.extendedZip LIKE search_term
+                    OR v.countyCode LIKE search_term
+                    OR v.region LIKE search_term
+                    OR v.protectionInfo LIKE search_term
+                    OR v.state_encrypted LIKE search_term
+                    ;
+  END;
+
+  vList = AddressList UNION vList;
+    
+  vList = SELECT v 
+          FROM vList:v 
+          ACCUM
+             @@vertex_list += v;
+  
+  RETURN @@vertex_list;  
+}
+
+CREATE OR REPLACE QUERY keyword_search_edge(STRING search_term, SET<STRING> edge_types) RETURNS (SET<EDGE>){ 
+    SetAccum<EDGE> @@edge_list;
+  
+    RETURN @@edge_list;
+}
+
+CREATE OR REPLACE QUERY keyword_search(STRING search_term = "", SET<STRING> vertex_types, SET<STRING> edge_types, BOOL count_only = FALSE, INT l=25, INT o=0) {
+    TYPEDEF TUPLE<STRING edge_id, STRING reverse_edge_id, EDGE e, STRING edge_type, VERTEX s, STRING source_type, VERTEX t, STRING target_type> edge_record;
+    SetAccum<EDGE> @@edge_set;
+    SetAccum<VERTEX> @@vertex_set;
+    SetAccum<STRING> @@edge_ids;
+    MapAccum<STRING, MapAccum<STRING, INT>> @@countMap;
+    HeapAccum<edge_record>(l, edge_id DESC) @@edge_records;
+    INT edge_counter = 0;
+  
+    vList (ANY) = {ANY};
+    IF search_term != "" THEN
+       @@vertex_set += keyword_search_vertex(search_term + "%", vertex_types);
+       @@edge_set += keyword_search_edge(search_term + "%", edge_types);
+    END;
+  
+    IF count(@@edge_set) > 0 THEN
+       vertex_list = SELECT s
+                     FROM vList:s -(:e)-:t
+                     WHERE e IN @@edge_set
+                     ACCUM
+                        STRING edge_id = e.type + ":" + to_string(getvid(s)) + ":" + to_string(getvid(t)),
+                        STRING reverse_edge_id = e.type + ":" + to_string(getvid(t)) + ":" + to_string(getvid(s)),
+                        @@edge_records += edge_record(edge_id, reverse_edge_id, e, e.type, s, s.type, t, t.type);
+  
+       @@edge_set.clear();
+       FOREACH ed IN @@edge_records DO
+          IF @@edge_ids.contains(ed.reverse_edge_id) THEN
+             @@edge_set += ed.e;
+             @@vertex_set += ed.s;
+             @@vertex_set += ed.t;
+             @@edge_ids += ed.edge_id;
+             @@countMap += ( "edge" -> (ed.edge_type -> 1));
+          END;
+       END;
+    END;
+  
+    vList = {@@vertex_set};
+    vertex_list = SELECT v
+                  FROM vList:v
+                  ACCUM
+                     @@countMap += ( "vertex" ->  (v.type -> 1) )
+                  ORDER BY getvid(v)
+                  LIMIT l OFFSET o;
+
+    IF count_only THEN
+        PRINT @@countMap.get("vertex") AS vertex_count_map;
+        PRINT @@countMap.get("edge") AS edge_count_map;
+    ELSE
+        PRINT vertex_list, @@countMap.get("vertex") AS vertex_count_map;
+        PRINT @@edge_set AS edge_list, @@countMap.get("edge") AS edge_count_map;
+    END;
+}
+
+CREATE OR REPLACE QUERY ToolkitCoreGenericOneHop(VERTEX p, SET<STRING> vertex_set, SET<STRING> edge_set, SET<VERTEX> filter_list, INT l = 10, INT o = 0) {
+  SetAccum <EDGE> @@edge_list;
+
+  seed = {p};
+  filtered_list = {filter_list};
+  nodes (ANY) = {p};
+
+  IF vertex_set.size() > 0 AND edge_set.size() > 0 THEN
+      nodes = SELECT n
+              FROM nodes:t-(edge_set:e)-vertex_set:n
+              SAMPLE l TARGET WHEN t.outdegree() > l
+              WHERE n NOT IN filter_list
+              ACCUM
+                 @@edge_list += e
+              ORDER BY getvid(n)
+              LIMIT l
+              OFFSET o;
+  ELSE IF vertex_set.size() > 0 THEN
+      nodes = SELECT n
+              FROM nodes:t-(:e)-vertex_set:n
+              SAMPLE l TARGET WHEN t.outdegree() > l
+              WHERE n NOT IN filter_list
+              ACCUM
+                 @@edge_list += e
+              ORDER BY getvid(n)
+              LIMIT l
+              OFFSET o;
+  ELSE IF edge_set.size() > 0 THEN
+      nodes = SELECT n
+              FROM nodes:t-(edge_set:e)-:n
+              SAMPLE l TARGET WHEN t.outdegree() > l
+              WHERE n NOT IN filter_list
+              ACCUM
+                 @@edge_list += e
+              ORDER BY getvid(n)
+              LIMIT l
+              OFFSET o;
+  ELSE 
+      nodes = SELECT n
+              FROM nodes:t-(:e)-:n
+              SAMPLE l TARGET WHEN t.outdegree() > l
+              WHERE n NOT IN filter_list
+              ACCUM
+                 @@edge_list += e
+              ORDER BY getvid(n)
+              LIMIT l
+              OFFSET o;
+  END;            
+
+  nodes = nodes UNION seed;
+
+  PRINT nodes AS vertex_list, @@edge_list AS edge_list;
+}
+
+CREATE OR REPLACE QUERY ToolkitCoreGetNeighborCount(SET<VERTEX> vertex_set, INT neighbor_count_limit = 500, BOOL calculate_supernode = FALSE) {
+  SumAccum<INT> @outdegree;
+  MapAccum<STRING, INT> @vNeighbors;
+  MapAccum<VERTEX, SetAccum<VERTEX>> @@neighborMap;
+  OrAccum @over_count_limit = FALSE;
+
+  vList = {vertex_set};
+
+  vList = SELECT v
+          FROM vList:v
+          ACCUM
+             v.@outdegree = v.outdegree(),
+             v.@over_count_limit = v.outdegree() > neighbor_count_limit,
+             IF NOT v.@over_count_limit OR calculate_supernode THEN
+                @@neighborMap += (v -> v.neighbors())
+             END
+          POST-ACCUM
+             FOREACH n IN @@neighborMap.get(v) DO
+                v.@vNeighbors += (n.type -> 1)
+             END;
+
+  PRINT vList AS vertex_list;
+}
+
+CREATE OR REPLACE QUERY advance_search_vertex_filter_subquery(Set<Vertex> vList, String attribute, String operat, String operand, String operand_type) RETURNS (SET<VERTEX>) { 
+  SetAccum<Vertex> @@vertex_set;
+  STRING pctg = "%";
+  STRING fixed_operand;
+  
+  result = {vList};
+  
+  IF upper(operand_type) == "STRING" THEN
+    IF upper(operat) == "LIKE" THEN 
+    fixed_operand = pctg + operand + pctg;
+      result = SELECT v 
+                FROM result:v
+                WHERE v.getAttr(attribute, "STRING") LIKE fixed_operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") > operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") < operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") >= operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") <= operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") == operand
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "STRING") != operand
+                ACCUM @@vertex_set += v;
+    END;
+  ELSE IF upper(operand_type) == "INT" THEN 
+    IF operat == ">" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") > str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") < str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") >= str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") <= str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") == str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "INT") != str_to_int(operand)
+                ACCUM @@vertex_set += v;
+    END;
+  ELSE IF upper(operand_type) == "FLOAT" THEN
+    IF operat == ">" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") > string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") < string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") >= string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") <= string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") == string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "FLOAT") != string_to_float(operand)
+                ACCUM @@vertex_set += v;
+    END;
+  ELSE IF upper(operand_type) == "DOUBLE" THEN
+    IF operat == ">" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") > string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") < string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") >= string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") <= string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") == string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DOUBLE") != string_to_double(operand)
+                ACCUM @@vertex_set += v;
+    END;
+  ELSE IF upper(operand_type) == "BOOL" THEN
+    IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "BOOL") == string_to_bool(upper(operand))
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "BOOL") != string_to_bool(upper(operand))
+                ACCUM @@vertex_set += v;
+    END;
+  ELSE IF upper(operand_type) == "DATETIME" THEN
+    IF operat == ">" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") > to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") < to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") >= to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") <= to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") == to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v 
+                FROM result:v 
+                WHERE v.getAttr(attribute, "DATETIME") != to_datetime(operand)
+                ACCUM @@vertex_set += v;
+    END;
+  END;
+  
+  RETURN @@vertex_set;
+}
+
+CREATE OR REPLACE QUERY advance_search_json_parser(STRING filter_criteria_json_array) RETURNS (SetAccum<JSONOBJECT>){
+    SetAccum<JSONOBJECT> @@expressions;
+    JSONARRAY filter_objects;
+    JSONOBJECT filter_object;
+    
+    filter_objects = parse_json_array(filter_criteria_json_array);
+    FOREACH i IN RANGE[0, filter_objects.size() - 1] DO
+        filter_object = filter_objects.getJsonObject(i);
+        IF NOT filter_object.containsKey("attribute") THEN
+            PRINT "No Attribute";
+        ELSE IF NOT filter_object.containsKey("operator") THEN
+            PRINT "No Operator";
+        ELSE IF NOT filter_object.containsKey("operand") THEN 
+            PRINT "No Operand";
+        ELSE IF NOT filter_object.containsKey("operand_type") THEN 
+            PRINT "No Operand Type";
+        END;
+        
+        @@expressions += filter_object;
+    END;
+  
+    PRINT @@expressions;
+    
+    RETURN @@expressions;
+}
+
+CREATE OR REPLACE QUERY advance_search_edge_filter_subquery(SET<VERTEX> vertex_list, SET<STRING> edge_types, STRING attribute, STRING operat, STRING operand, STRING operand_type) RETURNS (SET<EDGE>) { 
+  
+  SetAccum<Edge> @@edge_set;
+  STRING pctg = "%";
+  STRING fixed_operand;
+  
+  vList = vertex_list;
+  
+  IF upper(operand_type) == "STRING" THEN 
+    IF operat == "LIKE" THEN
+    fixed_operand = pctg + operand + pctg;
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") LIKE fixed_operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") > operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") < operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") >= operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") <= operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") == operand
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "STRING") != operand
+                ACCUM @@edge_set += e;
+    END;
+  ELSE IF upper(operand_type) == "INT" THEN 
+    IF operat == ">" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") > str_to_int(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") < str_to_int(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") >= str_to_int(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") <= str_to_int(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") == str_to_int(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "INT") != str_to_int(operand)
+                ACCUM @@edge_set += e;
+    END;
+  ELSE IF upper(operand_type) == "FLOAT" THEN 
+    IF operat == ">" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") > string_to_float(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") < string_to_float(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") >= string_to_float(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") <= string_to_float(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") == string_to_float(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "FLOAT") != string_to_float(operand)
+                ACCUM @@edge_set += e;
+    END;
+  ELSE IF upper(operand_type) == "DOUBLE" THEN 
+    IF operat == ">" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") > string_to_double(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") < string_to_double(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") >= string_to_double(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") <= string_to_double(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") == string_to_double(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DOUBLE") != string_to_double(operand)
+                ACCUM @@edge_set += e;
+    END;
+  ELSE IF upper(operand_type) == "BOOL" THEN 
+    IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "BOOL") == string_to_bool(upper(operand))
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "BOOL") != string_to_bool(upper(operand))
+                ACCUM @@edge_set += e;
+    END;
+  ELSE IF upper(operand_type) == "DATETIME" THEN 
+    IF operat == ">" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") > to_datetime(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") < to_datetime(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == ">=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") >= to_datetime(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "<=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") <= to_datetime(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "==" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") == to_datetime(operand)
+                ACCUM @@edge_set += e;
+    ELSE IF operat == "!=" THEN 
+      result = SELECT v
+                FROM vList:v -(edge_types:e)-:t
+                WHERE e.getAttr(attribute, "DATETIME") != to_datetime(operand)
+                ACCUM @@edge_set += e;
+    END;
+  END;
+  
+  RETURN @@edge_set;
+}
+
+CREATE OR REPLACE DISTRIBUTED QUERY advance_search(SET<STRING> vertex_types, SET<STRING> edge_types ,SET<STRING> attributes, BOOL vertex_search = TRUE,BOOL logical_and = FALSE,STRING filter_criteria_json = "[]",BOOL count_only = FALSE,INT l=25, INT o=0) {
+    /*There are no unique identifies in TigerGraph for edges, so we need a construct to hold and paginate*/
+    TYPEDEF TUPLE<STRING edge_id, STRING reverse_edge_id, EDGE e, STRING edge_type, VERTEX s, STRING source_type, VERTEX t, STRING target_type> edge_record;
+    STRING attribute, operat, operand, operand_type;
+  
+    SetAccum<EDGE>  @@edge_search_set, @@edge_filter_set, @@edge_result_set;
+    SetAccum<VERTEX> @@vertex_search_set, @@vertex_filter_set, @@vertex_result_set;
+    HeapAccum<edge_record>(l, edge_id DESC) @@edge_records;
+    MapAccum<STRING, MapAccum<STRING, INT>> @@countMap;
+    SetAccum<STRING> @@edge_ids;
+    SetAccum<JSONOBJECT> @@expressionSet;
+    BOOL firstRun = TRUE;
+    INT edge_counter = 0;
+  
+    @@expressionSet = advance_search_json_parser( filter_criteria_json );
+  
+    vList(ANY) = {};
+    IF count(vertex_types) > 0 THEN
+       vList = {vertex_types};
+    ELSE
+       vList = {ANY};
+    END;
+    
+    FOREACH expression IN @@expressionSet DO
+        attribute = expression.getString("attribute");
+        operat = expression.getString("operator");
+        operand = expression.getString("operand");
+        operand_type = expression.getString("operand_type");
+
+        IF vertex_search THEN
+  
+           IF firstRun THEN
+               firstRun = FALSE;
+               @@vertex_filter_set += advance_search_vertex_filter_subquery(vList, attribute, operat, operand, operand_type);
+               @@vertex_result_set += @@vertex_filter_set;
+           ELSE
+               @@vertex_filter_set += advance_search_vertex_filter_subquery(@@vertex_search_set, attribute, operat, operand, operand_type);
+           END;
+  
+           IF logical_and THEN
+              @@vertex_result_set = @@vertex_result_set INTERSECT @@vertex_filter_set;
+              @@vertex_search_set = @@vertex_result_set;
+           ELSE
+             vertex_list = vList;
+           END;      
+           @@vertex_filter_set.clear();
+      ELSE
+         IF firstRun THEN
+            firstRun = FALSE;
+            @@edge_filter_set += advance_search_edge_filter_subquery(vList, edge_types, attribute, operat, operand, operand_type);
+            @@edge_result_set += @@edge_filter_set;
+         ELSE
+            @@edge_filter_set += advance_search_edge_filter_subquery(@@vertex_search_set, edge_types, attribute, operat, operand, operand_type);
+         END;
+  
+         @@vertex_search_set.clear();
+         temp = SELECT v 
+                FROM vList:v-(:e)-:t 
+                WHERE e IN @@edge_filter_set
+                ACCUM 
+                   @@vertex_search_set += v, 
+                   @@vertex_search_set += t;
+  
+         IF logical_and THEN
+            @@edge_result_set = @@edge_result_set INTERSECT @@edge_filter_set;
+            @@vertex_result_set = @@vertex_search_set;
+         ELSE
+            @@edge_result_set = @@edge_result_set UNION @@edge_filter_set;
+            @@vertex_result_set = @@vertex_search_set UNION  @@vertex_result_set;
+         END;
+         @@edge_filter_set.clear();
+         vList = {@@vertex_search_set};
+       END;  
+    END;
+  
+    IF vertex_search THEN
+       vertex_list = {@@vertex_result_set};
+       vertex_list = SELECT v 
+                     FROM vertex_list:v
+                     ACCUM
+                        @@countMap += ( "vertex" ->  (v.type -> 1))    
+                     ORDER BY getvid(v)
+                     LIMIT l OFFSET o;
+    ELSE
+       @@edge_records.resize( count(@@edge_result_set) );
+
+       vertex_list = {@@vertex_result_set};
+       vertex_list = SELECT s 
+                     FROM vertex_list:s-(:e)-:t
+                     WHERE e IN @@edge_result_set
+                     ACCUM
+                        STRING edge_id = e.type + ":" + to_string(getvid(s)) + ":" + to_string(getvid(t)),
+                        STRING reverse_edge_id = e.type + ":" + to_string(getvid(t)) + ":" + to_string(getvid(s)),
+                        @@edge_records += edge_record(edge_id, reverse_edge_id, e, e.type, s, s.type, t, t.type);
+  
+        @@edge_result_set.clear();
+        @@vertex_result_set.clear();
+        FOREACH ed IN @@edge_records DO
+            IF NOT @@edge_ids.contains(ed.reverse_edge_id) THEN
+                IF (edge_counter BETWEEN o AND (o + l) - 1) AND edge_counter < l THEN
+                   @@edge_result_set += ed.e;
+                   @@vertex_result_set += ed.s;
+                   @@vertex_result_set += ed.t;
+                   @@edge_ids += ed.edge_id;
+                END;
+                @@countMap += ( "vertex" ->  (ed.source_type -> 1));
+                @@countMap += ( "vertex" -> (ed.target_type -> 1));
+                @@countMap += ( "edge" -> (ed.edge_type -> 1));
+            END;
+            edge_counter = edge_counter + 1;
+        END;
+
+        vertex_list = {@@vertex_result_set};
+    END;
+  
+    IF count_only THEN
+        PRINT @@countMap.get("vertex") AS vertex_count_map;
+        PRINT @@countMap.get("edge") AS edge_count_map;
+    ELSE
+        PRINT vertex_list, @@countMap.get("vertex") AS vertex_count_map;
+        PRINT @@edge_result_set AS edge_list, @@countMap.get("edge") AS edge_count_map;
+    END;
+}
+
+CREATE OR REPLACE QUERY path_to_type(SET<VERTEX> vertex_set, SET<STRING> target_types, INT hops = 5, INT l = 10) { 
+/*
+        Single-source shortest path algorithm, with unweighted edges.
+        From the source vertex, finds the unweighted shortest path (number of hops, INT value)
+        source: start vertex
+        v_type: vertex types to traverse
+        e_type: edge types to traverse
+        hops: max number of hops to go through           
+*/
+
+    MapAccum<VERTEX, MapAccum<VERTEX, MinAccum<INT>>> @@dis;
+    MapAccum<VERTEX, MapAccum<VERTEX, BOOL>> @@visited;
+    MapAccum<VERTEX, MapAccum<VERTEX, SetAccum<VERTEX>>> @@vertexPath;
+	  MapAccum<VERTEX, MapAccum<VERTEX, SetAccum<EDGE>>> @@edgePath;
+    SetAccum<VERTEX> @@target_vertex, @@vertex_list;
+    SetAccum<EDGE> @@edge_list;
+    SumAccum<INT> @@limit = 0;
+
+	  ##### Initialization  #####
+	  Source = {vertex_set};
+	  Source = SELECT s 
+			       FROM Source:s
+			       ACCUM 
+                 @@visited += (s -> (s -> true)), 
+				         @@dis += (s ->(s->0)),
+				         @@vertexPath += (s -> (s -> s) );
+  
+	  ResultSet = Source;
+
+	  ##### Calculate distances and paths #####
+	  WHILE(Source.size()>0 AND hops > @@limit) DO
+         Source = SELECT t
+               FROM Source:s -(:e)-> :t
+               ACCUM
+                  FOREACH v IN vertex_set DO
+                     IF @@vertexPath.get(v).containsKey(s) AND NOT @@visited.get(v).containsKey(t) THEN
+                        @@dis += ( v -> (t -> @@dis.get(v).get(s) + 1) ),
+                        @@vertexPath += (v -> (t -> @@vertexPath.get(v).get(s) ) ),
+                        @@vertexPath += (v -> (t -> t)),
+                        @@edgePath += (v -> (t -> @@edgePath.get(v).get(s) ) ),
+                        @@edgePath += (v -> (t -> e)),
+                        @@visited += (v -> (t -> true))
+                     END
+                  END
+               POST-ACCUM
+                  FOREACH v IN vertex_set DO
+                     IF t.type IN target_types AND @@dis.get(v).get(t) <= hops THEN
+                           @@target_vertex += t
+                     END
+                  END;  
+       @@limit += 1;
+	  END;
+  
+  
+  @@limit = 0;
+  FOREACH v IN @@target_vertex DO 
+     FOREACH t IN vertex_set DO
+        @@edge_list += @@edgePath.get(t).get(v);
+        @@vertex_list += @@vertexPath.get(t).get(v);
+        @@limit += 1;
+        IF @@limit >= l THEN 
+           BREAK;
+        END;
+     END;
+  
+     IF @@limit >= l THEN 
+        BREAK;
+     END;
+  END;
+  
+  vertex_list = @@vertex_list;
+  PRINT vertex_list;
+  PRINT @@edge_list AS edge_list;  
+}
